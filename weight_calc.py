@@ -495,6 +495,104 @@ def fmt_m3(v):
     return "{:.8g}".format(v)
 
 
+# --- v4: オブジェクト別の取得 / 集計 -------------------------------------
+def _object_name(oid):
+    """オブジェクト名を返す。無ければ "(unnamed)"。"""
+    try:
+        nm = rs.ObjectName(oid)
+    except Exception:
+        nm = None
+    if nm is None or nm == u"":
+        return u"(unnamed)"
+    return nm
+
+
+def _object_layer(oid):
+    """オブジェクトのレイヤー名 (フルパス) を返す。失敗時は "(no layer)"。"""
+    try:
+        ly = rs.ObjectLayer(oid)
+    except Exception:
+        ly = None
+    if ly is None or ly == u"":
+        return u"(no layer)"
+    return ly
+
+
+def collect_object_rows(ids):
+    """選択された各オブジェクト id について計算可能ジオメトリを収集し、
+    1 オブジェクト = 1 行に集計する。
+    返り値: (rows, all_results)
+      rows: dict のリスト。キー: id / name / layer / native_volume /
+            ok (成功ピース数) / fail (失敗ピース数)
+      all_results: 全ピースの詳細 (計算ログ用)
+    体積取得に失敗したオブジェクトもエラーで止めず、native_volume=0.0 /
+    fail>0 の行として残す (呼び出し側で警告表示)。"""
+    identity_xform = Rhino.Geometry.Transform.Identity
+    rows = []
+    all_results = []
+    for oid in ids:
+        ro = None
+        try:
+            ro = rs.coercerhinoobject(oid, True, False)
+        except Exception:
+            ro = None
+        if ro is None:
+            try:
+                ro = sc.doc.Objects.Find(oid)
+            except Exception:
+                ro = None
+        res = []
+        collect_computables(ro, identity_xform, u"", res, depth=0)
+        all_results.extend(res)
+        native = sum((r["raw_volume"] or 0.0) for r in res if r["success"])
+        ok = sum(1 for r in res if r["success"])
+        fail = sum(1 for r in res if not r["success"])
+        rows.append({
+            "id": str(oid),
+            "name": _object_name(oid),
+            "layer": _object_layer(oid),
+            "native_volume": native,
+            "ok": ok,
+            "fail": fail,
+        })
+    return rows, all_results
+
+
+def _pad(s, width):
+    """表示用に文字列を width まで右空白詰め (簡易, 全角は考慮しない)。"""
+    s = u"{}".format(s)
+    if len(s) < width:
+        return s + u" " * (width - len(s))
+    return s
+
+
+def print_object_table(rows, factor, unit_label):
+    """オブジェクト別の集計表をコマンドラインに出力する。"""
+    print(u"----- オブジェクト別一覧 (per-object) -----")
+    header = u"{} {} {} {} {} {} {}".format(
+        _pad(u"#", 3), _pad(u"id", 9), _pad(u"name", 16),
+        _pad(u"layer", 16), _pad(u"material", 12),
+        _pad(u"weight(kg)", 12), u"cost")
+    print(header)
+    for i, r in enumerate(rows):
+        vol_m3 = r["native_volume"] * factor
+        weight = vol_m3 * r["density"] if r.get("density") else 0.0
+        cost = material_cost(weight, r.get("price_per_kg"))
+        flag = u"" if r["fail"] == 0 else u"  [warn: {} skip]".format(r["fail"])
+        if r["ok"] == 0:
+            wt_str = u"-"
+            cost_str = u"-"
+            flag = u"  [skip: 体積取得不可]"
+        else:
+            wt_str = u"{:.2f}".format(weight)
+            cost_str = fmt_cost(cost)
+        print(u"{} {} {} {} {} {} {}{}".format(
+            _pad(i + 1, 3), _pad(_short_id(r["id"]), 9),
+            _pad(r["name"], 16), _pad(r["layer"], 16),
+            _pad(r.get("material_en", u"-"), 12),
+            _pad(wt_str, 12), cost_str, flag))
+
+
 # --- メイン --------------------------------------------------------------
 def main():
     factor, unit_code = get_volume_to_m3_factor()
@@ -518,29 +616,19 @@ def main():
         rs.MessageBox(msg, 16, u"重量計算 (Mass)")
         return
 
+    ids = None
+    object_rows = None
     if mode == "select":
         ids = pick_objects()
         if not ids:
             return
 
-        identity_xform = Rhino.Geometry.Transform.Identity
-        results = []
-        for oid in ids:
-            ro = None
-            try:
-                ro = rs.coercerhinoobject(oid, True, False)
-            except Exception:
-                ro = None
-            if ro is None:
-                try:
-                    ro = sc.doc.Objects.Find(oid)
-                except Exception:
-                    ro = None
-            collect_computables(ro, identity_xform, u"", results, depth=0)
+        # v4: 1 オブジェクト = 1 行に集計 (詳細ピースは all_results)
+        object_rows, all_results = collect_object_rows(ids)
 
-        # --- 計算ログ ---
+        # --- 計算ログ (全ピース詳細) ---
         print(u"----- 計算ログ -----")
-        for i, r in enumerate(results):
+        for i, r in enumerate(all_results):
             tag = u"OK  " if r["success"] else u"FAIL"
             depth_pad = u"  " * r["depth"]
             vol_str = fmt_raw(r["raw_volume"]) if r["success"] else u"-"
@@ -550,10 +638,10 @@ def main():
                 r["kind"], vol_str, child_tag, r.get("note", u""))
             print(line)
 
-        success_results = [r for r in results if r["success"]]
+        success_results = [r for r in all_results if r["success"]]
         total_native = sum((r["raw_volume"] or 0.0) for r in success_results)
         used = len(success_results)
-        failed = sum(1 for r in results if not r["success"])
+        failed = sum(1 for r in all_results if not r["success"])
 
         if used == 0:
             msg = (u"有効な体積を取得できませんでした。\n"
@@ -596,7 +684,15 @@ def main():
     # v3: 概算材料費 (単価未設定なら None)
     cost = material_cost(weight_kg, price_per_kg)
 
-    # --- 最終結果表示 ---
+    # v4: 各オブジェクト行へ素材を割り当て、per-object 表を出力 (select 時)
+    if mode == "select" and object_rows is not None:
+        for row in object_rows:
+            row["material_en"] = material_en
+            row["density"] = density
+            row["price_per_kg"] = price_per_kg
+        print_object_table(object_rows, factor, unit_label)
+
+    # --- 最終結果表示 (合計 / totals) ---
     lines = [u"----- 重量計算 (Mass) -----"]
     if mode == "select":
         lines.append(u"入力オブジェクト数: {}".format(input_count))
