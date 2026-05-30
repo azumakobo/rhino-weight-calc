@@ -34,6 +34,7 @@ v4 の主な変更点:
 
 import json
 import os
+import time
 
 import rhinoscriptsyntax as rs
 import scriptcontext as sc
@@ -558,6 +559,115 @@ def collect_object_rows(ids):
     return rows, all_results
 
 
+# --- v5: CSV 出力 --------------------------------------------------------
+CSV_COLUMNS = [
+    "object_id", "object_name", "layer", "material", "density",
+    "volume", "weight_kg", "price_per_kg", "estimated_cost",
+]
+
+
+def _timestamp():
+    """ファイル名用の日時文字列 (YYYYMMDD_HHMMSS)。"""
+    try:
+        return time.strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return "export"
+
+
+def _csv_field(value):
+    """CSV 1 フィールドを安全に整形する (RFC 4180 風)。
+    None は空欄。カンマ / 改行 / ダブルクォートを含む場合は引用符で囲む。"""
+    if value is None:
+        return u""
+    s = u"{}".format(value)
+    if (u"," in s) or (u"\"" in s) or (u"\n" in s) or (u"\r" in s):
+        s = u"\"" + s.replace(u"\"", u"\"\"") + u"\""
+    return s
+
+
+def csv_default_path():
+    """既定の保存先パスを返す。~/Desktop があればそこ、無ければ ~。"""
+    home = os.path.expanduser("~")
+    desktop = os.path.join(home, "Desktop")
+    base = desktop if os.path.isdir(desktop) else home
+    return os.path.join(base, "rhino_weight_{}.csv".format(_timestamp()))
+
+
+def build_csv_text(rows, factor):
+    """object_rows から CSV 本文 (ヘッダ + 各行) の文字列を組み立てる。"""
+    out = [u",".join(_csv_field(c) for c in CSV_COLUMNS)]
+    for r in rows:
+        vol_m3 = r["native_volume"] * factor
+        density = r.get("density")
+        weight = vol_m3 * density if density else 0.0
+        price = r.get("price_per_kg")
+        cost = material_cost(weight, price)
+        has_geom = r["ok"] > 0
+        cells = [
+            r["id"],
+            r["name"],
+            r["layer"],
+            r.get("material_en", u""),
+            u"{:.1f}".format(density) if density else u"",
+            u"{:.8g}".format(vol_m3) if has_geom else u"",
+            u"{:.4f}".format(weight) if has_geom else u"",
+            u"" if price is None else u"{:.2f}".format(price),
+            u"" if (cost is None or not has_geom) else u"{:.2f}".format(cost),
+        ]
+        out.append(u",".join(_csv_field(c) for c in cells))
+    return u"\n".join(out) + u"\n"
+
+
+def export_csv(rows, factor, path):
+    """CSV を UTF-8 (BOM 付き) で書き出す。成功時 path、失敗時 None を返す。
+    BOM は Excel が UTF-8 を正しく開くため。例外は投げない。"""
+    try:
+        text = build_csv_text(rows, factor)
+        f = open(path, "wb")
+        try:
+            f.write(b"\xef\xbb\xbf")  # UTF-8 BOM
+            f.write(text.encode("utf-8"))
+        finally:
+            f.close()
+        return path
+    except Exception:
+        return None
+
+
+def maybe_export_csv(rows, factor):
+    """ユーザーに CSV 出力の可否と保存先を尋ね、保存する。
+    保存できれば path を、スキップ/失敗時は None を返す (計算表示は止めない)。"""
+    try:
+        yn = rs.MessageBox(
+            u"計算結果を CSV に保存しますか?", 4, u"重量計算 (Mass)")
+    except Exception:
+        yn = None
+    # rs.MessageBox の Yes は 6。Yes 以外 / 取得失敗ならスキップ。
+    if yn != 6:
+        return None
+
+    default_path = csv_default_path()
+    path = None
+    try:
+        path = rs.SaveFileName(
+            u"CSV の保存先", u"CSV Files (*.csv)|*.csv||", None,
+            os.path.basename(default_path))
+    except Exception:
+        path = None
+    if not path:
+        # ダイアログが使えない / キャンセル時はデスクトップ等にフォールバック
+        path = default_path
+    if not path.lower().endswith(".csv"):
+        path = path + ".csv"
+
+    saved = export_csv(rows, factor, path)
+    if saved:
+        print(u"CSV を保存しました: {}".format(saved))
+    else:
+        print(u"CSV の保存に失敗しました (計算結果の表示は続行します)。")
+    return saved
+
+
 def _pad(s, width):
     """表示用に文字列を width まで右空白詰め (簡易, 全角は考慮しない)。"""
     s = u"{}".format(s)
@@ -723,6 +833,10 @@ def main():
         print(ln)
 
     rs.MessageBox(text, 0, u"重量計算 (Mass)")
+
+    # v5: select モードのみ CSV 出力を提案 (失敗しても上記表示は維持)
+    if mode == "select" and object_rows is not None:
+        maybe_export_csv(object_rows, factor)
 
 
 if __name__ == "__main__":
