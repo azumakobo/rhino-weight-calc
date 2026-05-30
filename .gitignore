@@ -16,3 +16,7 @@ __pycache__/
 !.env.example
 *.pem
 *.key
+
+# Tool-generated, machine-local files (never commit)
+.rhino_weight_calc_settings.json
+*.csv
