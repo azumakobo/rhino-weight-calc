@@ -34,30 +34,60 @@ v4 の主な変更点:
 
 import json
 import os
+import time
 
 import rhinoscriptsyntax as rs
 import scriptcontext as sc
 import Rhino  # RhinoCommon
 
 
-# --- 素材と密度 (kg/m^3) -------------------------------------------------
+# --- 素材データ ----------------------------------------------------------
+# 各素材は dict:
+#   jp           : 表示名 (日本語)
+#   en           : 英名 (設定ファイル / UserText 保存キー, ASCII)
+#   density      : 密度 (kg/m^3)
+#   price_per_kg : 単価 (通貨単位/kg)。None なら材料費は概算しない。
+#
+# ※ price_per_kg は v3 で追加した「概算用プレースホルダ」です。市況・調達先で
+#   大きく変動するため、必ず各自の実調達価格に更新してください。木材は重量単価
+#   ではなく材積/枚単位で流通するのが一般的なため、既定では None (材料費は出さ
+#   ない) にしています。
+CURRENCY = u"JPY"
+
 MATERIALS = [
     # --- 金属・無機 ---
-    (u"鋼",             7850.0, "Steel"),
-    (u"アルミ",         2700.0, "Aluminum"),
-    (u"ステンレス",     7930.0, "SUS"),
-    (u"コンクリート",   2400.0, "Concrete"),
-    (u"真鍮",           8500.0, "Brass"),
-    (u"銅",             8960.0, "Copper"),
-    # --- 木材 (気乾密度の代表値) ---
-    (u"杉",             380.0,  "Cedar"),
-    (u"桧",             410.0,  "Hinoki"),
-    (u"松",             510.0,  "Pine"),
-    (u"樫",             750.0,  "Oak"),
-    (u"集成材",         450.0,  "Glulam"),
-    (u"合板",           600.0,  "Plywood"),
-    (u"MDF",            750.0,  "MDF"),
+    {"jp": u"鋼",           "en": "Steel",    "density": 7850.0, "price_per_kg": 150.0},
+    {"jp": u"アルミ",       "en": "Aluminum", "density": 2700.0, "price_per_kg": 700.0},
+    {"jp": u"ステンレス",   "en": "SUS",      "density": 7930.0, "price_per_kg": 1000.0},
+    {"jp": u"コンクリート", "en": "Concrete", "density": 2400.0, "price_per_kg": 30.0},
+    {"jp": u"真鍮",         "en": "Brass",    "density": 8500.0, "price_per_kg": 1800.0},
+    {"jp": u"銅",           "en": "Copper",   "density": 8960.0, "price_per_kg": 2000.0},
+    # --- 木材 (気乾密度の代表値。重量単価が一般的でないため price は None) ---
+    {"jp": u"杉",           "en": "Cedar",    "density": 380.0,  "price_per_kg": None},
+    {"jp": u"桧",           "en": "Hinoki",   "density": 410.0,  "price_per_kg": None},
+    {"jp": u"松",           "en": "Pine",     "density": 510.0,  "price_per_kg": None},
+    {"jp": u"樫",           "en": "Oak",      "density": 750.0,  "price_per_kg": None},
+    {"jp": u"集成材",       "en": "Glulam",   "density": 450.0,  "price_per_kg": None},
+    {"jp": u"合板",         "en": "Plywood",  "density": 600.0,  "price_per_kg": None},
+    {"jp": u"MDF",          "en": "MDF",      "density": 750.0,  "price_per_kg": None},
 ]
+
+
+def material_cost(weight_kg, price_per_kg):
+    """概算材料費を返す。price_per_kg が None / 無効なら None。"""
+    if price_per_kg is None:
+        return None
+    try:
+        return float(weight_kg) * float(price_per_kg)
+    except Exception:
+        return None
+
+
+def fmt_cost(cost):
+    """材料費を整形。None は "-"。"""
+    if cost is None:
+        return u"-"
+    return u"{:,.0f} {}".format(cost, CURRENCY)
 
 
 # --- 設定ファイル (v2: 前回素材の記憶) -----------------------------------
@@ -101,12 +131,11 @@ def save_settings(settings):
 
 
 def _material_by_en(name):
-    """英名 (MATERIALS の 3 番目の要素) に一致する素材タプルを返す。
-    見つからなければ None。"""
+    """英名 (dict["en"]) に一致する素材 dict を返す。見つからなければ None。"""
     if not name:
         return None
     for m in MATERIALS:
-        if m[2] == name:
+        if m["en"] == name:
             return m
     return None
 
@@ -128,6 +157,33 @@ def save_last_material(material_name):
     if not isinstance(settings, dict):
         settings = {}
     settings["last_material"] = material_name
+    return save_settings(settings)
+
+
+def get_layer_materials():
+    """レイヤー名 -> 素材英名 の dict を返す (v6)。
+    現在の MATERIALS に存在する英名のみを通す。壊れていれば {}。"""
+    settings = load_settings()
+    lm = settings.get("layer_materials") if isinstance(settings, dict) else None
+    out = {}
+    if isinstance(lm, dict):
+        for layer, en in lm.items():
+            if _material_by_en(en) is not None:
+                out[layer] = en
+    return out
+
+
+def save_layer_material(layer, material_en):
+    """レイヤーに素材英名を割り当てて保存する (v6)。
+    他キー / 他レイヤーの割り当ては保持する。"""
+    settings = load_settings()
+    if not isinstance(settings, dict):
+        settings = {}
+    lm = settings.get("layer_materials")
+    if not isinstance(lm, dict):
+        lm = {}
+    lm[layer] = material_en
+    settings["layer_materials"] = lm
     return save_settings(settings)
 
 
@@ -187,20 +243,31 @@ def pick_volume_manual():
     return v
 
 
-def pick_material(default_en=None):
+def _material_label(m):
+    """ListBox 用の素材ラベルを組み立てる (密度 + 単価)。"""
+    if m["price_per_kg"] is None:
+        price = u"単価未設定"
+    else:
+        price = u"{:,.0f} {}/kg".format(m["price_per_kg"], CURRENCY)
+    return u"{}  ({:.0f} kg/m³, {}, {})".format(
+        m["jp"], m["density"], m["en"], price)
+
+
+def pick_material(default_en=None, prompt_extra=None):
     """素材選択ダイアログ。default_en (英名) が現在の MATERIALS にあれば
-    その項目を既定候補 (default) として事前選択し、プロンプトに前回素材を
-    併記する。Enter / そのまま OK で前回素材を再利用できる。
-    default_en が None / 不一致なら従来どおり先頭を既定にする。"""
-    labels = [u"{}  ({:.0f} kg/m³, {})".format(jp, density, en)
-              for (jp, density, en) in MATERIALS]
+    その項目を既定候補 (default) として事前選択し、プロンプトに併記する。
+    Enter / そのまま OK で既定素材を再利用できる。default_en が None / 不一致
+    なら従来どおり先頭を既定にする。prompt_extra はレイヤー名等の補足文。"""
+    labels = [_material_label(m) for m in MATERIALS]
     default_label = labels[0]
     message = u"素材を選択してください"
+    if prompt_extra:
+        message = message + u"  " + prompt_extra
     if default_en is not None:
-        for i, (jp, density, en) in enumerate(MATERIALS):
-            if en == default_en:
+        for i, m in enumerate(MATERIALS):
+            if m["en"] == default_en:
                 default_label = labels[i]
-                message = u"素材を選択してください  (前回: {})".format(en)
+                message = message + u"  (既定: {})".format(default_en)
                 break
     sel = rs.ListBox(
         labels,
@@ -456,6 +523,381 @@ def fmt_m3(v):
     return "{:.8g}".format(v)
 
 
+# --- v4: オブジェクト別の取得 / 集計 -------------------------------------
+def _object_name(oid):
+    """オブジェクト名を返す。無ければ "(unnamed)"。"""
+    try:
+        nm = rs.ObjectName(oid)
+    except Exception:
+        nm = None
+    if nm is None or nm == u"":
+        return u"(unnamed)"
+    return nm
+
+
+def _object_layer(oid):
+    """オブジェクトのレイヤー名 (フルパス) を返す。失敗時は "(no layer)"。"""
+    try:
+        ly = rs.ObjectLayer(oid)
+    except Exception:
+        ly = None
+    if ly is None or ly == u"":
+        return u"(no layer)"
+    return ly
+
+
+def collect_object_rows(ids):
+    """選択された各オブジェクト id について計算可能ジオメトリを収集し、
+    1 オブジェクト = 1 行に集計する。
+    返り値: (rows, all_results)
+      rows: dict のリスト。キー: id / name / layer / native_volume /
+            ok (成功ピース数) / fail (失敗ピース数)
+      all_results: 全ピースの詳細 (計算ログ用)
+    体積取得に失敗したオブジェクトもエラーで止めず、native_volume=0.0 /
+    fail>0 の行として残す (呼び出し側で警告表示)。"""
+    identity_xform = Rhino.Geometry.Transform.Identity
+    rows = []
+    all_results = []
+    for oid in ids:
+        ro = None
+        try:
+            ro = rs.coercerhinoobject(oid, True, False)
+        except Exception:
+            ro = None
+        if ro is None:
+            try:
+                ro = sc.doc.Objects.Find(oid)
+            except Exception:
+                ro = None
+        res = []
+        collect_computables(ro, identity_xform, u"", res, depth=0)
+        all_results.extend(res)
+        native = sum((r["raw_volume"] or 0.0) for r in res if r["success"])
+        ok = sum(1 for r in res if r["success"])
+        fail = sum(1 for r in res if not r["success"])
+        rows.append({
+            "id": str(oid),
+            "name": _object_name(oid),
+            "layer": _object_layer(oid),
+            "native_volume": native,
+            "ok": ok,
+            "fail": fail,
+        })
+    return rows, all_results
+
+
+# --- v5: CSV 出力 --------------------------------------------------------
+CSV_COLUMNS = [
+    "object_id", "object_name", "layer", "material", "density",
+    "volume", "weight_kg", "price_per_kg", "estimated_cost",
+]
+
+
+def _timestamp():
+    """ファイル名用の日時文字列 (YYYYMMDD_HHMMSS)。"""
+    try:
+        return time.strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return "export"
+
+
+def _csv_field(value):
+    """CSV 1 フィールドを安全に整形する (RFC 4180 風)。
+    None は空欄。カンマ / 改行 / ダブルクォートを含む場合は引用符で囲む。"""
+    if value is None:
+        return u""
+    s = u"{}".format(value)
+    if (u"," in s) or (u"\"" in s) or (u"\n" in s) or (u"\r" in s):
+        s = u"\"" + s.replace(u"\"", u"\"\"") + u"\""
+    return s
+
+
+def csv_default_path():
+    """既定の保存先パスを返す。~/Desktop があればそこ、無ければ ~。"""
+    home = os.path.expanduser("~")
+    desktop = os.path.join(home, "Desktop")
+    base = desktop if os.path.isdir(desktop) else home
+    return os.path.join(base, "rhino_weight_{}.csv".format(_timestamp()))
+
+
+def build_csv_text(rows, factor):
+    """object_rows から CSV 本文 (ヘッダ + 各行) の文字列を組み立てる。"""
+    out = [u",".join(_csv_field(c) for c in CSV_COLUMNS)]
+    for r in rows:
+        vol_m3 = r["native_volume"] * factor
+        density = r.get("density")
+        weight = vol_m3 * density if density else 0.0
+        price = r.get("price_per_kg")
+        cost = material_cost(weight, price)
+        has_geom = r["ok"] > 0
+        cells = [
+            r["id"],
+            r["name"],
+            r["layer"],
+            r.get("material_en", u""),
+            u"{:.1f}".format(density) if density else u"",
+            u"{:.8g}".format(vol_m3) if has_geom else u"",
+            u"{:.4f}".format(weight) if has_geom else u"",
+            u"" if price is None else u"{:.2f}".format(price),
+            u"" if (cost is None or not has_geom) else u"{:.2f}".format(cost),
+        ]
+        out.append(u",".join(_csv_field(c) for c in cells))
+    return u"\n".join(out) + u"\n"
+
+
+def export_csv(rows, factor, path):
+    """CSV を UTF-8 (BOM 付き) で書き出す。成功時 path、失敗時 None を返す。
+    BOM は Excel が UTF-8 を正しく開くため。例外は投げない。"""
+    try:
+        text = build_csv_text(rows, factor)
+        f = open(path, "wb")
+        try:
+            f.write(b"\xef\xbb\xbf")  # UTF-8 BOM
+            f.write(text.encode("utf-8"))
+        finally:
+            f.close()
+        return path
+    except Exception:
+        return None
+
+
+def maybe_export_csv(rows, factor):
+    """ユーザーに CSV 出力の可否と保存先を尋ね、保存する。
+    保存できれば path を、スキップ/失敗時は None を返す (計算表示は止めない)。"""
+    try:
+        yn = rs.MessageBox(
+            u"計算結果を CSV に保存しますか?", 4, u"重量計算 (Mass)")
+    except Exception:
+        yn = None
+    # rs.MessageBox の Yes は 6。Yes 以外 / 取得失敗ならスキップ。
+    if yn != 6:
+        return None
+
+    default_path = csv_default_path()
+    path = None
+    try:
+        path = rs.SaveFileName(
+            u"CSV の保存先", u"CSV Files (*.csv)|*.csv||", None,
+            os.path.basename(default_path))
+    except Exception:
+        path = None
+    if not path:
+        # ダイアログが使えない / キャンセル時はデスクトップ等にフォールバック
+        path = default_path
+    if not path.lower().endswith(".csv"):
+        path = path + ".csv"
+
+    saved = export_csv(rows, factor, path)
+    if saved:
+        print(u"CSV を保存しました: {}".format(saved))
+    else:
+        print(u"CSV の保存に失敗しました (計算結果の表示は続行します)。")
+    return saved
+
+
+def _pad(s, width):
+    """表示用に文字列を width まで右空白詰め (簡易, 全角は考慮しない)。"""
+    s = u"{}".format(s)
+    if len(s) < width:
+        return s + u" " * (width - len(s))
+    return s
+
+
+def print_object_table(rows, factor, unit_label):
+    """オブジェクト別の集計表をコマンドラインに出力する。"""
+    print(u"----- オブジェクト別一覧 (per-object) -----")
+    header = u"{} {} {} {} {} {} {}".format(
+        _pad(u"#", 3), _pad(u"id", 9), _pad(u"name", 16),
+        _pad(u"layer", 16), _pad(u"material", 12),
+        _pad(u"weight(kg)", 12), u"cost")
+    print(header)
+    for i, r in enumerate(rows):
+        vol_m3 = r["native_volume"] * factor
+        weight = vol_m3 * r["density"] if r.get("density") else 0.0
+        cost = material_cost(weight, r.get("price_per_kg"))
+        flag = u"" if r["fail"] == 0 else u"  [warn: {} skip]".format(r["fail"])
+        if r["ok"] == 0:
+            wt_str = u"-"
+            cost_str = u"-"
+            flag = u"  [skip: 体積取得不可]"
+        else:
+            wt_str = u"{:.2f}".format(weight)
+            cost_str = fmt_cost(cost)
+        print(u"{} {} {} {} {} {} {}{}".format(
+            _pad(i + 1, 3), _pad(_short_id(r["id"]), 9),
+            _pad(r["name"], 16), _pad(r["layer"], 16),
+            _pad(r.get("material_en", u"-"), 12),
+            _pad(wt_str, 12), cost_str, flag))
+
+
+def _assign_material_to_row(row, m):
+    """素材 dict を 1 行に割り当てる。"""
+    row["material_jp"] = m["jp"]
+    row["material_en"] = m["en"]
+    row["density"] = m["density"]
+    row["price_per_kg"] = m["price_per_kg"]
+
+
+# --- v7: Rhino UserText (rwc_*) による素材メタデータ ----------------------
+# 各オブジェクトに以下の UserText キーを読み書きする。rwc_ 以外には触れない。
+USERTEXT_KEYS = ("rwc_material", "rwc_density", "rwc_price_per_kg")
+
+
+def _material_from_usertext(oid):
+    """オブジェクトの UserText (rwc_material / rwc_density / rwc_price_per_kg)
+    から素材 dict を構成して返す。rwc_material が無い / 密度を決められない
+    場合は None (=フォールバック)。
+    既知素材 (MATERIALS) なら未指定の密度・単価はその素材値で補完する。"""
+    try:
+        mat = rs.GetUserText(oid, "rwc_material")
+    except Exception:
+        mat = None
+    if not mat:
+        return None
+
+    try:
+        d = rs.GetUserText(oid, "rwc_density")
+    except Exception:
+        d = None
+    try:
+        p = rs.GetUserText(oid, "rwc_price_per_kg")
+    except Exception:
+        p = None
+
+    base = _material_by_en(mat)
+
+    density = None
+    if d not in (None, u"", ""):
+        try:
+            density = float(d)
+        except Exception:
+            density = None
+    if density is None and base is not None:
+        density = base["density"]
+    if density is None or density <= 0.0:
+        return None  # 密度不明 → 計算できないのでフォールバック
+
+    price = None
+    if p not in (None, u"", ""):
+        try:
+            price = float(p)
+        except Exception:
+            price = None
+    if price is None and base is not None:
+        price = base["price_per_kg"]
+
+    jp = base["jp"] if base is not None else mat
+    return {"jp": jp, "en": mat, "density": density, "price_per_kg": price}
+
+
+def write_usertext_for_rows(object_rows):
+    """確認のうえ、各オブジェクトへ rwc_* UserText を書き込む。
+    rwc_ 以外のキーには触れない。書き込んだオブジェクト数を返す。
+    rwc_price_per_kg は単価が None のときは書き込まない (既存値は残す)。"""
+    try:
+        yn = rs.MessageBox(
+            u"選択オブジェクトに素材情報 (UserText rwc_*) を書き込みますか?\n"
+            u"既存の rwc_ 以外の属性には触れません。",
+            4, u"重量計算 (Mass)")
+    except Exception:
+        yn = None
+    if yn != 6:  # Yes 以外はスキップ
+        return 0
+
+    written = 0
+    for row in object_rows:
+        en = row.get("material_en")
+        if not en:
+            continue
+        try:
+            rs.SetUserText(row["id"], "rwc_material", en)
+            if row.get("density"):
+                rs.SetUserText(row["id"], "rwc_density",
+                               u"{:.4f}".format(row["density"]))
+            if row.get("price_per_kg") is not None:
+                rs.SetUserText(row["id"], "rwc_price_per_kg",
+                               u"{:.4f}".format(row["price_per_kg"]))
+            written += 1
+        except Exception:
+            pass
+    if written:
+        print(u"UserText を書き込みました: {} オブジェクト".format(written))
+    return written
+
+
+def clear_rwc_usertext(oid):
+    """指定オブジェクトの rwc_ プレフィックスの UserText のみ削除する。
+    他のキーには触れない。削除したキー数を返す。
+    (補助関数: 必要に応じて RunPythonScript から個別に呼べる。)"""
+    try:
+        keys = rs.GetUserText(oid)  # キー省略で全キー名のリスト
+    except Exception:
+        keys = None
+    if not keys:
+        return 0
+    removed = 0
+    for k in keys:
+        if u"{}".format(k).startswith("rwc_"):
+            try:
+                rs.SetUserText(oid, k)  # 値省略でキー削除
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+# --- v6/v7: オブジェクト別 素材解決 --------------------------------------
+def resolve_materials_for_rows(object_rows):
+    """各 object_row に素材を割り当てる。優先順位:
+      1. (v7) オブジェクトの UserText rwc_material
+      2. (v6) レイヤー材料設定 (layer_materials)
+      3. (v2) 前回素材 (last_material) を既定にしてプロンプト
+      4. ユーザーが素材を選択
+    プロンプトはレイヤー単位でキャッシュし、選択結果は last_material と
+    layer_materials に保存する。
+    戻り値: True=全行解決 / False=ユーザーがプロンプトをキャンセル。"""
+    layer_materials = get_layer_materials()
+    last_en = get_last_material()
+    prompt_cache = {}  # layer -> material dict (この実行でプロンプト選択した分)
+
+    for row in object_rows:
+        layer = row["layer"]
+        m = None
+
+        # 1. UserText (v7 で有効化。未実装段階では None)
+        ut = _material_from_usertext(row["id"])
+        if ut is not None:
+            m = ut
+            row["material_source"] = u"usertext"
+
+        # 2. レイヤー材料設定
+        if m is None and layer in layer_materials:
+            m = _material_by_en(layer_materials[layer])
+            if m is not None:
+                row["material_source"] = u"layer"
+
+        # 3. この実行でそのレイヤーに対し既にプロンプト選択済み
+        if m is None and layer in prompt_cache:
+            m = prompt_cache[layer]
+            row["material_source"] = u"layer"
+
+        # 4. プロンプト (前回素材を既定に、レイヤー名を併記)
+        if m is None:
+            picked = pick_material(
+                last_en, prompt_extra=u"[layer: {}]".format(layer))
+            if picked is None:
+                return False
+            m = picked
+            prompt_cache[layer] = m
+            save_layer_material(layer, m["en"])
+            save_last_material(m["en"])
+            last_en = m["en"]
+            row["material_source"] = u"selected"
+
+        _assign_material_to_row(row, m)
+    return True
+
+
 # --- メイン --------------------------------------------------------------
 def main():
     factor, unit_code = get_volume_to_m3_factor()
@@ -479,29 +921,19 @@ def main():
         rs.MessageBox(msg, 16, u"重量計算 (Mass)")
         return
 
+    ids = None
+    object_rows = None
     if mode == "select":
         ids = pick_objects()
         if not ids:
             return
 
-        identity_xform = Rhino.Geometry.Transform.Identity
-        results = []
-        for oid in ids:
-            ro = None
-            try:
-                ro = rs.coercerhinoobject(oid, True, False)
-            except Exception:
-                ro = None
-            if ro is None:
-                try:
-                    ro = sc.doc.Objects.Find(oid)
-                except Exception:
-                    ro = None
-            collect_computables(ro, identity_xform, u"", results, depth=0)
+        # v4: 1 オブジェクト = 1 行に集計 (詳細ピースは all_results)
+        object_rows, all_results = collect_object_rows(ids)
 
-        # --- 計算ログ ---
+        # --- 計算ログ (全ピース詳細) ---
         print(u"----- 計算ログ -----")
-        for i, r in enumerate(results):
+        for i, r in enumerate(all_results):
             tag = u"OK  " if r["success"] else u"FAIL"
             depth_pad = u"  " * r["depth"]
             vol_str = fmt_raw(r["raw_volume"]) if r["success"] else u"-"
@@ -511,10 +943,10 @@ def main():
                 r["kind"], vol_str, child_tag, r.get("note", u""))
             print(line)
 
-        success_results = [r for r in results if r["success"]]
+        success_results = [r for r in all_results if r["success"]]
         total_native = sum((r["raw_volume"] or 0.0) for r in success_results)
         used = len(success_results)
-        failed = sum(1 for r in results if not r["success"])
+        failed = sum(1 for r in all_results if not r["success"])
 
         if used == 0:
             msg = (u"有効な体積を取得できませんでした。\n"
@@ -540,35 +972,67 @@ def main():
         unit_label = u"-"
         raw_unit_label = u"-"
 
-    # v2: 前回素材を既定候補として復元 (無ければ None で従来動作)
-    last_en = get_last_material()
-    picked = pick_material(last_en)
-    if picked is None:
-        return
-    material_jp, density, material_en = picked
-
-    # v2: 確定した素材を次回用に保存 (失敗しても計算は続行)
-    save_last_material(material_en)
-
-    weight_kg = volume_m3 * density
-
-    # --- 最終結果表示 ---
-    lines = [u"----- 重量計算 (Mass) -----"]
     if mode == "select":
+        # v6/v7: オブジェクト別に素材を解決
+        #   UserText (v7) > レイヤー材料 (v6) > 前回素材 (v2) > 選択
+        if not resolve_materials_for_rows(object_rows):
+            return  # ユーザーがプロンプトをキャンセル
+
+        # v4: per-object 一覧
+        print_object_table(object_rows, factor, unit_label)
+
+        # v6: 合計は行ごとに集計 (素材がレイヤー別に異なり得るため)
+        total_weight = 0.0
+        total_cost = 0.0
+        any_cost = False
+        materials_used = []
+        for row in object_rows:
+            if row["ok"] == 0:
+                continue
+            w = (row["native_volume"] * factor) * row["density"]
+            total_weight += w
+            c = material_cost(w, row["price_per_kg"])
+            if c is not None:
+                total_cost += c
+                any_cost = True
+            if row["material_en"] not in materials_used:
+                materials_used.append(row["material_en"])
+
+        lines = [u"----- 重量計算 合計 (totals) -----"]
         lines.append(u"入力オブジェクト数: {}".format(input_count))
         lines.append(u"体積計算ジオメトリ数: {}".format(geom_count))
-    else:
-        lines.append(u"入力: 直接入力 (m³)")
-    lines.append(u"素材: {} ({})".format(material_jp, material_en))
-    lines.append(u"密度: {:.0f} kg/m3".format(density))
-    if mode == "select":
+        lines.append(u"使用素材: {}".format(
+            u", ".join(materials_used) if materials_used else u"-"))
         lines.append(u"モデル単位: {}".format(unit_label))
-        lines.append(u"Raw volume: {} {}".format(
+        lines.append(u"Raw volume (合計): {} {}".format(
             fmt_raw(total_native), raw_unit_label))
-    lines.append(u"Volume: {} m3".format(fmt_m3(volume_m3)))
-    lines.append(u"Weight: {:.2f} kg".format(weight_kg))
-    if mode == "select":
+        lines.append(u"Volume (合計): {} m3".format(fmt_m3(volume_m3)))
+        lines.append(u"Weight (合計): {:.2f} kg".format(total_weight))
+        lines.append(u"概算材料費 (合計): {}".format(
+            fmt_cost(total_cost) if any_cost else u"-"))
         lines.append(u"失敗: {}".format(failed))
+    else:
+        # manual: 単一素材 (v2/v3 の従来パス)
+        last_en = get_last_material()
+        picked = pick_material(last_en)
+        if picked is None:
+            return
+        save_last_material(picked["en"])
+        weight_kg = volume_m3 * picked["density"]
+        cost = material_cost(weight_kg, picked["price_per_kg"])
+
+        lines = [u"----- 重量計算 (Mass) -----"]
+        lines.append(u"入力: 直接入力 (m³)")
+        lines.append(u"素材: {} ({})".format(picked["jp"], picked["en"]))
+        lines.append(u"密度: {:.0f} kg/m3".format(picked["density"]))
+        lines.append(u"Volume: {} m3".format(fmt_m3(volume_m3)))
+        lines.append(u"Weight: {:.2f} kg".format(weight_kg))
+        if picked["price_per_kg"] is None:
+            lines.append(u"単価 (price_per_kg): 未設定")
+        else:
+            lines.append(u"単価 (price_per_kg): {:,.0f} {}/kg".format(
+                picked["price_per_kg"], CURRENCY))
+        lines.append(u"概算材料費 (estimated): {}".format(fmt_cost(cost)))
 
     text = "\n".join(lines)
 
@@ -576,6 +1040,12 @@ def main():
         print(ln)
 
     rs.MessageBox(text, 0, u"重量計算 (Mass)")
+
+    if mode == "select" and object_rows is not None:
+        # v7: 確認のうえ素材情報を UserText (rwc_*) として書き込む
+        write_usertext_for_rows(object_rows)
+        # v5: CSV 出力を提案 (失敗しても上記表示は維持)
+        maybe_export_csv(object_rows, factor)
 
 
 if __name__ == "__main__":
