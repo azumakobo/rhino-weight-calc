@@ -738,10 +738,112 @@ def _assign_material_to_row(row, m):
     row["price_per_kg"] = m["price_per_kg"]
 
 
+# --- v7: Rhino UserText (rwc_*) による素材メタデータ ----------------------
+# 各オブジェクトに以下の UserText キーを読み書きする。rwc_ 以外には触れない。
+USERTEXT_KEYS = ("rwc_material", "rwc_density", "rwc_price_per_kg")
+
+
 def _material_from_usertext(oid):
-    """(v7 で実装) オブジェクトの UserText から素材を読む。
-    v6 段階では常に None を返す (UserText 優先は v7 で有効化)。"""
-    return None
+    """オブジェクトの UserText (rwc_material / rwc_density / rwc_price_per_kg)
+    から素材 dict を構成して返す。rwc_material が無い / 密度を決められない
+    場合は None (=フォールバック)。
+    既知素材 (MATERIALS) なら未指定の密度・単価はその素材値で補完する。"""
+    try:
+        mat = rs.GetUserText(oid, "rwc_material")
+    except Exception:
+        mat = None
+    if not mat:
+        return None
+
+    try:
+        d = rs.GetUserText(oid, "rwc_density")
+    except Exception:
+        d = None
+    try:
+        p = rs.GetUserText(oid, "rwc_price_per_kg")
+    except Exception:
+        p = None
+
+    base = _material_by_en(mat)
+
+    density = None
+    if d not in (None, u"", ""):
+        try:
+            density = float(d)
+        except Exception:
+            density = None
+    if density is None and base is not None:
+        density = base["density"]
+    if density is None or density <= 0.0:
+        return None  # 密度不明 → 計算できないのでフォールバック
+
+    price = None
+    if p not in (None, u"", ""):
+        try:
+            price = float(p)
+        except Exception:
+            price = None
+    if price is None and base is not None:
+        price = base["price_per_kg"]
+
+    jp = base["jp"] if base is not None else mat
+    return {"jp": jp, "en": mat, "density": density, "price_per_kg": price}
+
+
+def write_usertext_for_rows(object_rows):
+    """確認のうえ、各オブジェクトへ rwc_* UserText を書き込む。
+    rwc_ 以外のキーには触れない。書き込んだオブジェクト数を返す。
+    rwc_price_per_kg は単価が None のときは書き込まない (既存値は残す)。"""
+    try:
+        yn = rs.MessageBox(
+            u"選択オブジェクトに素材情報 (UserText rwc_*) を書き込みますか?\n"
+            u"既存の rwc_ 以外の属性には触れません。",
+            4, u"重量計算 (Mass)")
+    except Exception:
+        yn = None
+    if yn != 6:  # Yes 以外はスキップ
+        return 0
+
+    written = 0
+    for row in object_rows:
+        en = row.get("material_en")
+        if not en:
+            continue
+        try:
+            rs.SetUserText(row["id"], "rwc_material", en)
+            if row.get("density"):
+                rs.SetUserText(row["id"], "rwc_density",
+                               u"{:.4f}".format(row["density"]))
+            if row.get("price_per_kg") is not None:
+                rs.SetUserText(row["id"], "rwc_price_per_kg",
+                               u"{:.4f}".format(row["price_per_kg"]))
+            written += 1
+        except Exception:
+            pass
+    if written:
+        print(u"UserText を書き込みました: {} オブジェクト".format(written))
+    return written
+
+
+def clear_rwc_usertext(oid):
+    """指定オブジェクトの rwc_ プレフィックスの UserText のみ削除する。
+    他のキーには触れない。削除したキー数を返す。
+    (補助関数: 必要に応じて RunPythonScript から個別に呼べる。)"""
+    try:
+        keys = rs.GetUserText(oid)  # キー省略で全キー名のリスト
+    except Exception:
+        keys = None
+    if not keys:
+        return 0
+    removed = 0
+    for k in keys:
+        if u"{}".format(k).startswith("rwc_"):
+            try:
+                rs.SetUserText(oid, k)  # 値省略でキー削除
+                removed += 1
+            except Exception:
+                pass
+    return removed
 
 
 # --- v6/v7: オブジェクト別 素材解決 --------------------------------------
@@ -939,8 +1041,10 @@ def main():
 
     rs.MessageBox(text, 0, u"重量計算 (Mass)")
 
-    # v5: select モードのみ CSV 出力を提案 (失敗しても上記表示は維持)
     if mode == "select" and object_rows is not None:
+        # v7: 確認のうえ素材情報を UserText (rwc_*) として書き込む
+        write_usertext_for_rows(object_rows)
+        # v5: CSV 出力を提案 (失敗しても上記表示は維持)
         maybe_export_csv(object_rows, factor)
 
 
