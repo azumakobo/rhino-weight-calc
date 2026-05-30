@@ -160,6 +160,33 @@ def save_last_material(material_name):
     return save_settings(settings)
 
 
+def get_layer_materials():
+    """レイヤー名 -> 素材英名 の dict を返す (v6)。
+    現在の MATERIALS に存在する英名のみを通す。壊れていれば {}。"""
+    settings = load_settings()
+    lm = settings.get("layer_materials") if isinstance(settings, dict) else None
+    out = {}
+    if isinstance(lm, dict):
+        for layer, en in lm.items():
+            if _material_by_en(en) is not None:
+                out[layer] = en
+    return out
+
+
+def save_layer_material(layer, material_en):
+    """レイヤーに素材英名を割り当てて保存する (v6)。
+    他キー / 他レイヤーの割り当ては保持する。"""
+    settings = load_settings()
+    if not isinstance(settings, dict):
+        settings = {}
+    lm = settings.get("layer_materials")
+    if not isinstance(lm, dict):
+        lm = {}
+    lm[layer] = material_en
+    settings["layer_materials"] = lm
+    return save_settings(settings)
+
+
 # --- Rhino の単位系コード -------------------------------------------------
 SUPPORTED_UNITS = {2: "mm", 3: "cm", 4: "m"}
 LENGTH_TO_M_FALLBACK = {2: 1.0e-3, 3: 1.0e-2, 4: 1.0}
@@ -703,6 +730,72 @@ def print_object_table(rows, factor, unit_label):
             _pad(wt_str, 12), cost_str, flag))
 
 
+def _assign_material_to_row(row, m):
+    """素材 dict を 1 行に割り当てる。"""
+    row["material_jp"] = m["jp"]
+    row["material_en"] = m["en"]
+    row["density"] = m["density"]
+    row["price_per_kg"] = m["price_per_kg"]
+
+
+def _material_from_usertext(oid):
+    """(v7 で実装) オブジェクトの UserText から素材を読む。
+    v6 段階では常に None を返す (UserText 優先は v7 で有効化)。"""
+    return None
+
+
+# --- v6/v7: オブジェクト別 素材解決 --------------------------------------
+def resolve_materials_for_rows(object_rows):
+    """各 object_row に素材を割り当てる。優先順位:
+      1. (v7) オブジェクトの UserText rwc_material
+      2. (v6) レイヤー材料設定 (layer_materials)
+      3. (v2) 前回素材 (last_material) を既定にしてプロンプト
+      4. ユーザーが素材を選択
+    プロンプトはレイヤー単位でキャッシュし、選択結果は last_material と
+    layer_materials に保存する。
+    戻り値: True=全行解決 / False=ユーザーがプロンプトをキャンセル。"""
+    layer_materials = get_layer_materials()
+    last_en = get_last_material()
+    prompt_cache = {}  # layer -> material dict (この実行でプロンプト選択した分)
+
+    for row in object_rows:
+        layer = row["layer"]
+        m = None
+
+        # 1. UserText (v7 で有効化。未実装段階では None)
+        ut = _material_from_usertext(row["id"])
+        if ut is not None:
+            m = ut
+            row["material_source"] = u"usertext"
+
+        # 2. レイヤー材料設定
+        if m is None and layer in layer_materials:
+            m = _material_by_en(layer_materials[layer])
+            if m is not None:
+                row["material_source"] = u"layer"
+
+        # 3. この実行でそのレイヤーに対し既にプロンプト選択済み
+        if m is None and layer in prompt_cache:
+            m = prompt_cache[layer]
+            row["material_source"] = u"layer"
+
+        # 4. プロンプト (前回素材を既定に、レイヤー名を併記)
+        if m is None:
+            picked = pick_material(
+                last_en, prompt_extra=u"[layer: {}]".format(layer))
+            if picked is None:
+                return False
+            m = picked
+            prompt_cache[layer] = m
+            save_layer_material(layer, m["en"])
+            save_last_material(m["en"])
+            last_en = m["en"]
+            row["material_source"] = u"selected"
+
+        _assign_material_to_row(row, m)
+    return True
+
+
 # --- メイン --------------------------------------------------------------
 def main():
     factor, unit_code = get_volume_to_m3_factor()
@@ -777,55 +870,67 @@ def main():
         unit_label = u"-"
         raw_unit_label = u"-"
 
-    # v2: 前回素材を既定候補として復元 (無ければ None で従来動作)
-    last_en = get_last_material()
-    picked = pick_material(last_en)
-    if picked is None:
-        return
-    material_jp = picked["jp"]
-    density = picked["density"]
-    material_en = picked["en"]
-    price_per_kg = picked["price_per_kg"]
+    if mode == "select":
+        # v6/v7: オブジェクト別に素材を解決
+        #   UserText (v7) > レイヤー材料 (v6) > 前回素材 (v2) > 選択
+        if not resolve_materials_for_rows(object_rows):
+            return  # ユーザーがプロンプトをキャンセル
 
-    # v2: 確定した素材を次回用に保存 (失敗しても計算は続行)
-    save_last_material(material_en)
-
-    weight_kg = volume_m3 * density
-    # v3: 概算材料費 (単価未設定なら None)
-    cost = material_cost(weight_kg, price_per_kg)
-
-    # v4: 各オブジェクト行へ素材を割り当て、per-object 表を出力 (select 時)
-    if mode == "select" and object_rows is not None:
-        for row in object_rows:
-            row["material_en"] = material_en
-            row["density"] = density
-            row["price_per_kg"] = price_per_kg
+        # v4: per-object 一覧
         print_object_table(object_rows, factor, unit_label)
 
-    # --- 最終結果表示 (合計 / totals) ---
-    lines = [u"----- 重量計算 (Mass) -----"]
-    if mode == "select":
+        # v6: 合計は行ごとに集計 (素材がレイヤー別に異なり得るため)
+        total_weight = 0.0
+        total_cost = 0.0
+        any_cost = False
+        materials_used = []
+        for row in object_rows:
+            if row["ok"] == 0:
+                continue
+            w = (row["native_volume"] * factor) * row["density"]
+            total_weight += w
+            c = material_cost(w, row["price_per_kg"])
+            if c is not None:
+                total_cost += c
+                any_cost = True
+            if row["material_en"] not in materials_used:
+                materials_used.append(row["material_en"])
+
+        lines = [u"----- 重量計算 合計 (totals) -----"]
         lines.append(u"入力オブジェクト数: {}".format(input_count))
         lines.append(u"体積計算ジオメトリ数: {}".format(geom_count))
-    else:
-        lines.append(u"入力: 直接入力 (m³)")
-    lines.append(u"素材: {} ({})".format(material_jp, material_en))
-    lines.append(u"密度: {:.0f} kg/m3".format(density))
-    if mode == "select":
+        lines.append(u"使用素材: {}".format(
+            u", ".join(materials_used) if materials_used else u"-"))
         lines.append(u"モデル単位: {}".format(unit_label))
-        lines.append(u"Raw volume: {} {}".format(
+        lines.append(u"Raw volume (合計): {} {}".format(
             fmt_raw(total_native), raw_unit_label))
-    lines.append(u"Volume: {} m3".format(fmt_m3(volume_m3)))
-    lines.append(u"Weight: {:.2f} kg".format(weight_kg))
-    # v3: 単価と概算材料費
-    if price_per_kg is None:
-        lines.append(u"単価 (price_per_kg): 未設定")
-    else:
-        lines.append(u"単価 (price_per_kg): {:,.0f} {}/kg".format(
-            price_per_kg, CURRENCY))
-    lines.append(u"概算材料費 (estimated): {}".format(fmt_cost(cost)))
-    if mode == "select":
+        lines.append(u"Volume (合計): {} m3".format(fmt_m3(volume_m3)))
+        lines.append(u"Weight (合計): {:.2f} kg".format(total_weight))
+        lines.append(u"概算材料費 (合計): {}".format(
+            fmt_cost(total_cost) if any_cost else u"-"))
         lines.append(u"失敗: {}".format(failed))
+    else:
+        # manual: 単一素材 (v2/v3 の従来パス)
+        last_en = get_last_material()
+        picked = pick_material(last_en)
+        if picked is None:
+            return
+        save_last_material(picked["en"])
+        weight_kg = volume_m3 * picked["density"]
+        cost = material_cost(weight_kg, picked["price_per_kg"])
+
+        lines = [u"----- 重量計算 (Mass) -----"]
+        lines.append(u"入力: 直接入力 (m³)")
+        lines.append(u"素材: {} ({})".format(picked["jp"], picked["en"]))
+        lines.append(u"密度: {:.0f} kg/m3".format(picked["density"]))
+        lines.append(u"Volume: {} m3".format(fmt_m3(volume_m3)))
+        lines.append(u"Weight: {:.2f} kg".format(weight_kg))
+        if picked["price_per_kg"] is None:
+            lines.append(u"単価 (price_per_kg): 未設定")
+        else:
+            lines.append(u"単価 (price_per_kg): {:,.0f} {}/kg".format(
+                picked["price_per_kg"], CURRENCY))
+        lines.append(u"概算材料費 (estimated): {}".format(fmt_cost(cost)))
 
     text = "\n".join(lines)
 
