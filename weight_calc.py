@@ -40,24 +40,53 @@ import scriptcontext as sc
 import Rhino  # RhinoCommon
 
 
-# --- 素材と密度 (kg/m^3) -------------------------------------------------
+# --- 素材データ ----------------------------------------------------------
+# 各素材は dict:
+#   jp           : 表示名 (日本語)
+#   en           : 英名 (設定ファイル / UserText 保存キー, ASCII)
+#   density      : 密度 (kg/m^3)
+#   price_per_kg : 単価 (通貨単位/kg)。None なら材料費は概算しない。
+#
+# ※ price_per_kg は v3 で追加した「概算用プレースホルダ」です。市況・調達先で
+#   大きく変動するため、必ず各自の実調達価格に更新してください。木材は重量単価
+#   ではなく材積/枚単位で流通するのが一般的なため、既定では None (材料費は出さ
+#   ない) にしています。
+CURRENCY = u"JPY"
+
 MATERIALS = [
     # --- 金属・無機 ---
-    (u"鋼",             7850.0, "Steel"),
-    (u"アルミ",         2700.0, "Aluminum"),
-    (u"ステンレス",     7930.0, "SUS"),
-    (u"コンクリート",   2400.0, "Concrete"),
-    (u"真鍮",           8500.0, "Brass"),
-    (u"銅",             8960.0, "Copper"),
-    # --- 木材 (気乾密度の代表値) ---
-    (u"杉",             380.0,  "Cedar"),
-    (u"桧",             410.0,  "Hinoki"),
-    (u"松",             510.0,  "Pine"),
-    (u"樫",             750.0,  "Oak"),
-    (u"集成材",         450.0,  "Glulam"),
-    (u"合板",           600.0,  "Plywood"),
-    (u"MDF",            750.0,  "MDF"),
+    {"jp": u"鋼",           "en": "Steel",    "density": 7850.0, "price_per_kg": 150.0},
+    {"jp": u"アルミ",       "en": "Aluminum", "density": 2700.0, "price_per_kg": 700.0},
+    {"jp": u"ステンレス",   "en": "SUS",      "density": 7930.0, "price_per_kg": 1000.0},
+    {"jp": u"コンクリート", "en": "Concrete", "density": 2400.0, "price_per_kg": 30.0},
+    {"jp": u"真鍮",         "en": "Brass",    "density": 8500.0, "price_per_kg": 1800.0},
+    {"jp": u"銅",           "en": "Copper",   "density": 8960.0, "price_per_kg": 2000.0},
+    # --- 木材 (気乾密度の代表値。重量単価が一般的でないため price は None) ---
+    {"jp": u"杉",           "en": "Cedar",    "density": 380.0,  "price_per_kg": None},
+    {"jp": u"桧",           "en": "Hinoki",   "density": 410.0,  "price_per_kg": None},
+    {"jp": u"松",           "en": "Pine",     "density": 510.0,  "price_per_kg": None},
+    {"jp": u"樫",           "en": "Oak",      "density": 750.0,  "price_per_kg": None},
+    {"jp": u"集成材",       "en": "Glulam",   "density": 450.0,  "price_per_kg": None},
+    {"jp": u"合板",         "en": "Plywood",  "density": 600.0,  "price_per_kg": None},
+    {"jp": u"MDF",          "en": "MDF",      "density": 750.0,  "price_per_kg": None},
 ]
+
+
+def material_cost(weight_kg, price_per_kg):
+    """概算材料費を返す。price_per_kg が None / 無効なら None。"""
+    if price_per_kg is None:
+        return None
+    try:
+        return float(weight_kg) * float(price_per_kg)
+    except Exception:
+        return None
+
+
+def fmt_cost(cost):
+    """材料費を整形。None は "-"。"""
+    if cost is None:
+        return u"-"
+    return u"{:,.0f} {}".format(cost, CURRENCY)
 
 
 # --- 設定ファイル (v2: 前回素材の記憶) -----------------------------------
@@ -101,12 +130,11 @@ def save_settings(settings):
 
 
 def _material_by_en(name):
-    """英名 (MATERIALS の 3 番目の要素) に一致する素材タプルを返す。
-    見つからなければ None。"""
+    """英名 (dict["en"]) に一致する素材 dict を返す。見つからなければ None。"""
     if not name:
         return None
     for m in MATERIALS:
-        if m[2] == name:
+        if m["en"] == name:
             return m
     return None
 
@@ -187,20 +215,31 @@ def pick_volume_manual():
     return v
 
 
-def pick_material(default_en=None):
+def _material_label(m):
+    """ListBox 用の素材ラベルを組み立てる (密度 + 単価)。"""
+    if m["price_per_kg"] is None:
+        price = u"単価未設定"
+    else:
+        price = u"{:,.0f} {}/kg".format(m["price_per_kg"], CURRENCY)
+    return u"{}  ({:.0f} kg/m³, {}, {})".format(
+        m["jp"], m["density"], m["en"], price)
+
+
+def pick_material(default_en=None, prompt_extra=None):
     """素材選択ダイアログ。default_en (英名) が現在の MATERIALS にあれば
-    その項目を既定候補 (default) として事前選択し、プロンプトに前回素材を
-    併記する。Enter / そのまま OK で前回素材を再利用できる。
-    default_en が None / 不一致なら従来どおり先頭を既定にする。"""
-    labels = [u"{}  ({:.0f} kg/m³, {})".format(jp, density, en)
-              for (jp, density, en) in MATERIALS]
+    その項目を既定候補 (default) として事前選択し、プロンプトに併記する。
+    Enter / そのまま OK で既定素材を再利用できる。default_en が None / 不一致
+    なら従来どおり先頭を既定にする。prompt_extra はレイヤー名等の補足文。"""
+    labels = [_material_label(m) for m in MATERIALS]
     default_label = labels[0]
     message = u"素材を選択してください"
+    if prompt_extra:
+        message = message + u"  " + prompt_extra
     if default_en is not None:
-        for i, (jp, density, en) in enumerate(MATERIALS):
-            if en == default_en:
+        for i, m in enumerate(MATERIALS):
+            if m["en"] == default_en:
                 default_label = labels[i]
-                message = u"素材を選択してください  (前回: {})".format(en)
+                message = message + u"  (既定: {})".format(default_en)
                 break
     sel = rs.ListBox(
         labels,
@@ -545,12 +584,17 @@ def main():
     picked = pick_material(last_en)
     if picked is None:
         return
-    material_jp, density, material_en = picked
+    material_jp = picked["jp"]
+    density = picked["density"]
+    material_en = picked["en"]
+    price_per_kg = picked["price_per_kg"]
 
     # v2: 確定した素材を次回用に保存 (失敗しても計算は続行)
     save_last_material(material_en)
 
     weight_kg = volume_m3 * density
+    # v3: 概算材料費 (単価未設定なら None)
+    cost = material_cost(weight_kg, price_per_kg)
 
     # --- 最終結果表示 ---
     lines = [u"----- 重量計算 (Mass) -----"]
@@ -567,6 +611,13 @@ def main():
             fmt_raw(total_native), raw_unit_label))
     lines.append(u"Volume: {} m3".format(fmt_m3(volume_m3)))
     lines.append(u"Weight: {:.2f} kg".format(weight_kg))
+    # v3: 単価と概算材料費
+    if price_per_kg is None:
+        lines.append(u"単価 (price_per_kg): 未設定")
+    else:
+        lines.append(u"単価 (price_per_kg): {:,.0f} {}/kg".format(
+            price_per_kg, CURRENCY))
+    lines.append(u"概算材料費 (estimated): {}".format(fmt_cost(cost)))
     if mode == "select":
         lines.append(u"失敗: {}".format(failed))
 
