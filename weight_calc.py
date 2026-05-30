@@ -11,6 +11,15 @@ Rhino.Geometry.VolumeMassProperties.Compute() を直接使用する。
 
 Rhino for Mac の RunPythonScript で動作することを想定。
 
+v2 (材料記憶機能) の変更点:
+  - 前回選択した素材をローカル設定ファイル
+    (~/.rhino_weight_calc_settings.json) に保存し、次回実行時に
+    素材選択ダイアログの既定候補 (default) として復元する。
+  - 標準ライブラリ json / os のみ使用。外部ライブラリ非依存。
+  - 設定ファイルが無い / 壊れている / 保存名が現在の MATERIALS に
+    無い場合は、エラーで止めずに従来どおりの素材選択へフォールバック。
+  - 体積取得・密度データ・重量計算ロジック (下記 v4) は不変更。
+
 v4 の主な変更点:
   - Block Instance (InstanceReferenceGeometry) を展開し、定義内の
     Brep/Mesh/Extrusion/SubD に InstanceXform を適用してから合算
@@ -22,6 +31,9 @@ v4 の主な変更点:
   - 各ピースの計算ログ (id / kind / raw volume / success / note) を
     コマンド履歴に出力
 """
+
+import json
+import os
 
 import rhinoscriptsyntax as rs
 import scriptcontext as sc
@@ -46,6 +58,77 @@ MATERIALS = [
     (u"合板",           600.0,  "Plywood"),
     (u"MDF",            750.0,  "MDF"),
 ]
+
+
+# --- 設定ファイル (v2: 前回素材の記憶) -----------------------------------
+# ユーザーホーム直下に保存。外部ライブラリ非依存 (json / os のみ)。
+# 英名 (MATERIALS の 3 番目の要素, ASCII) のみ保存するため、
+# 日本語パス・エンコーディングの影響を受けない。
+SETTINGS_PATH = os.path.join(
+    os.path.expanduser("~"), ".rhino_weight_calc_settings.json")
+
+
+def load_settings():
+    """設定ファイル (JSON) を dict で読み込む。
+    存在しない / 壊れている / 読み込み失敗時は {} を返す (例外を投げない)。"""
+    try:
+        f = open(SETTINGS_PATH, "r")
+        try:
+            data = json.load(f)
+        finally:
+            f.close()
+    except Exception:
+        return {}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def save_settings(settings):
+    """設定 dict を JSON で保存する。失敗しても重量計算は止めない。
+    成功時 True / 失敗時 False を返す。"""
+    try:
+        f = open(SETTINGS_PATH, "w")
+        try:
+            # ensure_ascii=True (既定) でファイルは純 ASCII になり、
+            # Mac / 日本語環境でもエンコーディング問題を起こさない。
+            json.dump(settings, f, indent=2, sort_keys=True)
+        finally:
+            f.close()
+        return True
+    except Exception:
+        return False
+
+
+def _material_by_en(name):
+    """英名 (MATERIALS の 3 番目の要素) に一致する素材タプルを返す。
+    見つからなければ None。"""
+    if not name:
+        return None
+    for m in MATERIALS:
+        if m[2] == name:
+            return m
+    return None
+
+
+def get_last_material():
+    """保存済み last_material (英名) を返す。
+    現在の MATERIALS に存在する場合のみ返し、無ければ None。"""
+    settings = load_settings()
+    name = settings.get("last_material") if isinstance(settings, dict) else None
+    if _material_by_en(name) is not None:
+        return name
+    return None
+
+
+def save_last_material(material_name):
+    """選択された素材の英名を last_material として保存する。
+    既存の他キーは保持する。保存失敗は無視する (戻り値で判定可)。"""
+    settings = load_settings()
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["last_material"] = material_name
+    return save_settings(settings)
 
 
 # --- Rhino の単位系コード -------------------------------------------------
@@ -104,14 +187,26 @@ def pick_volume_manual():
     return v
 
 
-def pick_material():
+def pick_material(default_en=None):
+    """素材選択ダイアログ。default_en (英名) が現在の MATERIALS にあれば
+    その項目を既定候補 (default) として事前選択し、プロンプトに前回素材を
+    併記する。Enter / そのまま OK で前回素材を再利用できる。
+    default_en が None / 不一致なら従来どおり先頭を既定にする。"""
     labels = [u"{}  ({:.0f} kg/m³, {})".format(jp, density, en)
               for (jp, density, en) in MATERIALS]
+    default_label = labels[0]
+    message = u"素材を選択してください"
+    if default_en is not None:
+        for i, (jp, density, en) in enumerate(MATERIALS):
+            if en == default_en:
+                default_label = labels[i]
+                message = u"素材を選択してください  (前回: {})".format(en)
+                break
     sel = rs.ListBox(
         labels,
-        message=u"素材を選択してください",
+        message=message,
         title=u"重量計算 (Mass)",
-        default=labels[0],
+        default=default_label,
     )
     if sel is None:
         return None
@@ -445,10 +540,15 @@ def main():
         unit_label = u"-"
         raw_unit_label = u"-"
 
-    picked = pick_material()
+    # v2: 前回素材を既定候補として復元 (無ければ None で従来動作)
+    last_en = get_last_material()
+    picked = pick_material(last_en)
     if picked is None:
         return
     material_jp, density, material_en = picked
+
+    # v2: 確定した素材を次回用に保存 (失敗しても計算は続行)
+    save_last_material(material_en)
 
     weight_kg = volume_m3 * density
 
